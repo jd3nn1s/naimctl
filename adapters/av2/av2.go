@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 )
 
 type Command byte
@@ -27,8 +28,12 @@ const (
 const RESPONSE_SYSTEM_STATUS Response = 0x69
 
 type SystemStatusResponse struct {
-	n      *NaimAV2
 	status [4]byte
+}
+
+type UnknownResponse struct {
+	MsgCode Response
+	Data    []byte
 }
 
 type Input uint8
@@ -39,37 +44,43 @@ const INPUT_VIP2 Input = 0x2
 const INPUT_OP1 Input = 0x7
 const INPUT_OP2 Input = 0x8
 
-type SystemStatusCallback func(SystemStatusResponse) error
+type responseConstraint interface {
+	UnknownResponse | SystemStatusResponse
+}
+
+type callback[T responseConstraint] func(T) error
 
 type NaimAV2 struct {
 	writer io.Writer
 	reader *bufio.Reader
 
-	systemStatusCallbacks []SystemStatusCallback
+	systemStatusCallbacks    []callback[SystemStatusResponse]
+	unknownResponseCallbacks []callback[UnknownResponse]
 }
 
 func NewNaim(reader io.Reader, writer io.Writer) NaimAV2 {
 	bufReader := bufio.NewReader(reader)
 	return NaimAV2{
-		reader:                bufReader,
-		writer:                writer,
-		systemStatusCallbacks: []SystemStatusCallback{},
+		reader:                   bufReader,
+		writer:                   writer,
+		systemStatusCallbacks:    []callback[SystemStatusResponse]{},
+		unknownResponseCallbacks: []callback[UnknownResponse]{},
 	}
 }
 
-func (n *NaimAV2) addSystemStatusHandler(fn SystemStatusCallback) {
+func (n *NaimAV2) AddSystemStatusHandler(fn callback[SystemStatusResponse]) {
 	n.systemStatusCallbacks = append(n.systemStatusCallbacks, fn)
 }
 
-func (n *NaimAV2) clearSystemStatusHandlers() {
-	n.systemStatusCallbacks = []SystemStatusCallback{}
+func (n *NaimAV2) AddUnknownResponseHandler(fn callback[UnknownResponse]) {
+	n.unknownResponseCallbacks = append(n.unknownResponseCallbacks, fn)
 }
 
 type response interface {
-	callHandlers() error
+	callHandlers(n *NaimAV2) error
 }
 
-func (n *NaimAV2) read() error {
+func (n *NaimAV2) Read() error {
 	// "#AV2 " + <1-28 bytes> + 0xFF
 	var start = []byte("#AV2 ")
 	const minLength = len("#AV2 bb")
@@ -91,16 +102,27 @@ func (n *NaimAV2) read() error {
 	switch msgCode {
 	case RESPONSE_SYSTEM_STATUS:
 		r, err = n.newSystemStatusResponse(buf)
+	default:
+		r = UnknownResponse{
+			MsgCode: msgCode,
+			Data:    buf,
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("unable to parse data for message type %v: %w", msgCode, err)
 	}
-	if r != nil {
-		if err = r.callHandlers(); err != nil {
-			return fmt.Errorf("unable to call handlers for message type %v: %w", msgCode, err)
-		}
+	if err = r.callHandlers(n); err != nil {
+		return fmt.Errorf("unable to call handlers for message type %v: %w", msgCode, err)
 	}
 	return nil
+}
+
+func (n *NaimAV2) ReadAll() {
+	for {
+		if err := n.Read(); err != nil {
+			log.Println("unable to read from serial:", err)
+		}
+	}
 }
 
 func (n *NaimAV2) newSystemStatusResponse(data []byte) (SystemStatusResponse, error) {
@@ -109,16 +131,11 @@ func (n *NaimAV2) newSystemStatusResponse(data []byte) (SystemStatusResponse, er
 		return SystemStatusResponse{}, fmt.Errorf("expected length %v but received %v", dataLen, len(data))
 	}
 	arrData := (*[dataLen]byte)(data)
-	return SystemStatusResponse{n, *arrData}, nil
+	return SystemStatusResponse{*arrData}, nil
 }
 
-func (ssr SystemStatusResponse) callHandlers() error {
-	for _, cb := range ssr.n.systemStatusCallbacks {
-		if err := cb(ssr); err != nil {
-			return fmt.Errorf("error when calling SystemStatusResponse callback: %w", err)
-		}
-	}
-	return nil
+func (ssr SystemStatusResponse) callHandlers(n *NaimAV2) error {
+	return callHandlers(n.systemStatusCallbacks, ssr)
 }
 
 func (ssr SystemStatusResponse) standby() bool {
@@ -150,6 +167,20 @@ func (ssr SystemStatusResponse) volume() int {
 		vol = 99
 	}
 	return int(vol)
+}
+
+func (ur UnknownResponse) callHandlers(n *NaimAV2) error {
+	return callHandlers(n.unknownResponseCallbacks, ur)
+}
+
+func callHandlers[T ~[]callback[S], S responseConstraint](cbs T, s S) error {
+	for _, cb := range cbs {
+		fmt.Printf("%v", cb)
+		if err := cb(s); err != nil {
+			return fmt.Errorf("error when calling SystemStatusResponse callback: %w", err)
+		}
+	}
+	return nil
 }
 
 func volumeValueByte(level int) (byte, error) {
