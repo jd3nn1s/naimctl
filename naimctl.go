@@ -8,13 +8,9 @@ import (
 )
 
 type Naim struct {
-	av2  av2.NaimAV2
-	port *serial.Port
-
-	Volume  int
-	Input   av2.Input
-	Muted   bool
-	Standby bool
+	av2          av2.NaimAV2
+	port         *serial.Port
+	SystemStatus av2.SystemStatusResponse
 }
 
 func NewNaim(portDevice string) (*Naim, error) {

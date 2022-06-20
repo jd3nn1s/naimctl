@@ -3,10 +3,9 @@ package av2
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
-	"log"
+	"time"
 )
 
 type Command byte
@@ -51,11 +50,13 @@ type responseConstraint interface {
 type callback[T responseConstraint] func(T) error
 
 type NaimAV2 struct {
-	writer io.Writer
+	writer io.Writer // must not be buffered, as Naim protocol requires specific timing
 	reader *bufio.Reader
 
 	systemStatusCallbacks    []callback[SystemStatusResponse]
 	unknownResponseCallbacks []callback[UnknownResponse]
+
+	lastSend time.Time
 }
 
 func NewNaim(reader io.Reader, writer io.Writer) NaimAV2 {
@@ -86,6 +87,9 @@ func (n *NaimAV2) Read() error {
 	const minLength = len("#AV2 bb")
 	buf, err := n.reader.ReadBytes(0xFF)
 	if err != nil {
+		if err == io.EOF && len(buf) == 0 {
+			return err
+		}
 		return fmt.Errorf("unable to read complete naim message: %w", err)
 	}
 	if len(buf) < minLength {
@@ -95,9 +99,8 @@ func (n *NaimAV2) Read() error {
 		return fmt.Errorf("unexpected message start: '%v'", buf[:len(start)])
 	}
 	// strip off the starting char, device ID, and the delimiter
-	buf = buf[len(start) : len(buf)-1]
-	msgCode := Response(buf[0])
-	buf = buf[1:]
+	msgCode := Response(buf[len(start)])
+	buf = buf[len(start)+1 : len(buf)-1]
 	var r response
 	switch msgCode {
 	case RESPONSE_SYSTEM_STATUS:
@@ -117,10 +120,14 @@ func (n *NaimAV2) Read() error {
 	return nil
 }
 
-func (n *NaimAV2) ReadAll() {
+func (n *NaimAV2) ReadAll() error {
 	for {
 		if err := n.Read(); err != nil {
-			log.Println("unable to read from serial:", err)
+			if err != io.EOF {
+				return err
+			} else {
+				return nil
+			}
 		}
 	}
 }
@@ -138,11 +145,11 @@ func (ssr SystemStatusResponse) callHandlers(n *NaimAV2) error {
 	return callHandlers(n.systemStatusCallbacks, ssr)
 }
 
-func (ssr SystemStatusResponse) standby() bool {
+func (ssr SystemStatusResponse) Standby() bool {
 	return ssr.status[0]&0x80 == 0
 }
 
-func (ssr SystemStatusResponse) input() Input {
+func (ssr SystemStatusResponse) Input() Input {
 	input := Input(ssr.status[1] & 0x0f)
 	switch input {
 	case INPUT_VIP1:
@@ -157,11 +164,11 @@ func (ssr SystemStatusResponse) input() Input {
 	return INPUT_UNKNOWN
 }
 
-func (ssr SystemStatusResponse) muted() bool {
+func (ssr SystemStatusResponse) Muted() bool {
 	return ssr.status[2]&0x80 > 0
 }
 
-func (ssr SystemStatusResponse) volume() int {
+func (ssr SystemStatusResponse) Volume() int {
 	vol := ssr.status[2] & 0x7f
 	if vol > 99 {
 		vol = 99
@@ -181,11 +188,4 @@ func callHandlers[T ~[]callback[S], S responseConstraint](cbs T, s S) error {
 		}
 	}
 	return nil
-}
-
-func volumeValueByte(level int) (byte, error) {
-	if level < 0 || level > 99 {
-		return 0, errors.New("level must be between 0 and 99")
-	}
-	return byte(level), nil
 }
